@@ -1,0 +1,102 @@
+#!/bin/bash
+set -euo pipefail
+
+# 1. Privilege check
+if [[ $EUID -ne 0 ]]; then
+   echo "Error: This script must be run as root (sudo)." >&2
+   exit 1
+fi
+
+echo "=========================================="
+echo "          SECURE ERASE TOOL               "
+echo "=========================================="
+echo ""
+
+# 2. List available drives (excludes loop, zram, and CD/DVD drives)
+echo "Drives detected on the system:"
+echo "------------------------------------------"
+lsblk -d -n -o NAME,SIZE,ROTA,TRAN,MODEL | grep -vE '^(loop|zram|sr)' | awk '{
+    type = ($3 == "1") ? "HDD" : "SSD/Flash";
+    printf "  /dev/%-8s | Size: %-8s | Rotational: %-3s (%s) | Bus: %-6s | Model: %s\n", $1, $2, $3, type, $4, $5
+}'
+echo "------------------------------------------"
+echo ""
+
+# 3. Prompt for target drive input
+read -rp "Enter the name of the drive to erase (e.g., sdb or nvme0n1): " TARGET_NAME
+
+# Path sanitization
+TARGET_NAME=$(basename "$TARGET_NAME")
+TARGET_DEV="/dev/$TARGET_NAME"
+
+if [[ ! -b "$TARGET_DEV" ]]; then
+    echo "Error: $TARGET_DEV is not a valid block device." >&2
+    exit 1
+fi
+
+# 4. Drive type inspection
+ROTA=$(lsblk -d -n -o ROTA "$TARGET_DEV" | tr -d ' ')
+TRAN=$(lsblk -d -n -o TRAN "$TARGET_DEV" | tr -d ' ')
+MODEL=$(lsblk -d -n -o MODEL "$TARGET_DEV")
+
+echo ""
+echo "Selected device       : $TARGET_DEV"
+echo "Model                 : $MODEL"
+echo "Interface type (TRAN) : $TRAN"
+echo ""
+
+# 5. Explicit safety confirmation
+read -rp "ARE YOU SURE? All data on $TARGET_DEV will be LOST. (type 'YES' to confirm): " CONFIRM
+if [[ "$CONFIRM" != "YES" ]]; then
+    echo "Operation canceled."
+    exit 0
+fi
+
+# Automatic unmounting of all active partitions on the drive
+echo "Unmounting partitions on $TARGET_DEV..."
+umount "${TARGET_DEV}"* 2>/dev/null || true
+
+# 6. Execution of the appropriate method
+echo ""
+echo "Starting the wipe process..."
+
+if [[ "$TARGET_NAME" =~ ^nvme ]]; then
+    echo "[NVMe Format Method] Sending reset command to the NVMe controller..."
+    nvme format "$TARGET_DEV" -s 1 -f
+    
+elif [[ "$TRAN" == "usb" ]]; then
+    if [[ "$ROTA" == "1" ]]; then
+        echo "[USB HDD Method] Full zero-overwrite via dd..."
+        dd if=/dev/zero of="$TARGET_DEV" bs=4M status=progress conv=fdatasync
+    else
+        echo "[USB Flash Drive / External SSD Method] Overwriting via shred (1 random pass)..."
+        shred -v -n 1 "$TARGET_DEV"
+        echo "Writing a final pass of zeros..."
+        dd if=/dev/zero of="$TARGET_DEV" bs=4M count=100 status=none conv=fdatasync
+    fi
+
+elif [[ "$ROTA" == "0" ]]; then
+    echo "[SATA SSD Method] Attempting Secure Erase via hdparm..."
+    
+    # Check for Frozen state
+    FROZEN=$(hdparm -I "$TARGET_DEV" 2>/dev/null | grep -i "not frozen" || true)
+    if [[ -z "$FROZEN" ]]; then
+        echo "Warning: The SSD is locked in 'frozen' mode by the BIOS/UEFI."
+        echo "Falling back to full erase via 'shred' (1 pass)..."
+        shred -v -n 1 "$TARGET_DEV"
+    else
+        echo "Setting temporary password 'NULL'..."
+        hdparm --user-master u --security-set-pass NULL "$TARGET_DEV"
+        echo "Executing hardware Secure Erase..."
+        hdparm --user-master u --security-erase NULL "$TARGET_DEV"
+    fi
+
+else
+    echo "[Internal HDD Method] Writing zeros across the entire drive..."
+    dd if=/dev/zero of="$TARGET_DEV" bs=4M status=progress conv=fdatasync
+fi
+
+echo ""
+echo "=========================================="
+echo " Operation completed successfully on $TARGET_DEV"
+echo "=========================================="
